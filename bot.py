@@ -53,7 +53,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я бот 🤖\n"
         "Я умею работать с:\n"
         "📄 Текстом\n"
-        "📷 Фото (с подписью)\n"
+        "📷 Фото (с подписью и текстом)\n"
         "📂 Файлами (.py, .txt, .json)\n"
     )
 
@@ -65,7 +65,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
-# фото + подпись
+# фото + подпись + текст
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.photo[-1].get_file()
     file_bytes = await file.download_as_bytearray()
@@ -74,10 +74,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_b64 = base64.b64encode(file_bytes).decode("utf-8")
     image_data = f"data:image/jpeg;base64,{file_b64}"
 
-    caption = update.message.caption or "Опиши это изображение"
+    # собираем caption и текст (если есть)
+    caption = update.message.caption or ""
+    extra_text = update.message.text or ""   # иногда Telegram кладёт текст в text
+    full_question = (caption + " " + extra_text).strip()
+    if not full_question:
+        full_question = "Опиши это изображение"
 
     user_content = [
-        {"type": "text", "text": f"Вопрос пользователя: {caption}\nВот изображение:"},
+        {"type": "text", "text": f"Вопрос пользователя: {full_question}\nВот изображение:"},
         {"type": "image_url", "image_url": image_data}
     ]
 
