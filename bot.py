@@ -14,6 +14,8 @@ logger = logging.getLogger("tg-gpt-bot")
 # DAN-инструкции
 DAN_PROMPT = """
 Ты полезный ассистент, который честно и понятно отвечает на вопросы.
+Если вместе с фото есть текстовый вопрос — всегда отвечай на него, используя фото как контекст.
+Не ограничивайся простым описанием изображения.
 """
 
 # Render URL (для webhook)
@@ -53,7 +55,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я бот 🤖\n"
         "Я умею работать с:\n"
         "📄 Текстом\n"
-        "📷 Фото (с подписью и текстом)\n"
+        "📷 Фото (с подписью)\n"
         "📂 Файлами (.py, .txt, .json)\n"
     )
 
@@ -65,7 +67,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
-# фото + подпись + текст
+# фото + caption (текст к фото)
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.photo[-1].get_file()
     file_bytes = await file.download_as_bytearray()
@@ -74,22 +76,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_b64 = base64.b64encode(file_bytes).decode("utf-8")
     image_data = f"data:image/jpeg;base64,{file_b64}"
 
-    # собираем caption и текст (если есть)
-    caption = update.message.caption or ""
-    extra_text = update.message.text or ""
-    full_question = (caption + " " + extra_text).strip()
-    if not full_question:
+    # Берём caption (подпись к фото)
+    caption = update.message.caption
+    if not caption:
         full_question = "Что изображено на фото?"
+    else:
+        full_question = caption.strip()
 
     user_content = [
         {
             "type": "text",
-            "text": (
-                f"Вопрос пользователя: '{full_question}'. "
-                f"Ниже приложено изображение. Используй его как контекст, "
-                f"но обязательно ответь именно на вопрос. "
-                f"Если вопрос не связан с изображением — отвечай всё равно."
-            )
+            "text": f"Вопрос пользователя: {full_question}\n\n"
+                    f"Ниже приложено изображение. Используй его как контекст."
         },
         {"type": "image_url", "image_url": image_data}
     ]
