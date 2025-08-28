@@ -67,7 +67,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
-# фото + caption (текст к фото)
+# фото + caption (подпись к фото)
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.photo[-1].get_file()
     file_bytes = await file.download_as_bytearray()
@@ -76,18 +76,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_b64 = base64.b64encode(file_bytes).decode("utf-8")
     image_data = f"data:image/jpeg;base64,{file_b64}"
 
-    # Берём caption (подпись к фото)
+    # Берём только caption (текст к фото)
     caption = update.message.caption
-    if not caption:
-        full_question = "Что изображено на фото?"
-    else:
+    if caption:
         full_question = caption.strip()
+    else:
+        full_question = "Что изображено на фото?"
 
+    # Собираем сообщение для GPT
     user_content = [
         {
             "type": "text",
-            "text": f"Вопрос пользователя: {full_question}\n\n"
-                    f"Ниже приложено изображение. Используй его как контекст."
+            "text": (
+                f"Пользователь спросил: {full_question}\n\n"
+                f"Ниже приложено изображение. "
+                f"Используй его как контекст, но отвечай именно на вопрос."
+            )
         },
         {"type": "image_url", "image_url": image_data}
     ]
@@ -117,6 +121,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = "⚠️ Ошибка при обработке изображения"
 
     await update.message.reply_text(reply)
+
 
 
 # файлы (.py, .txt, .json и т.д.)
