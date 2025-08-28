@@ -76,13 +76,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # собираем caption и текст (если есть)
     caption = update.message.caption or ""
-    extra_text = update.message.text or ""   # иногда Telegram кладёт текст в text
+    extra_text = update.message.text or ""
     full_question = (caption + " " + extra_text).strip()
     if not full_question:
-        full_question = "Опиши это изображение"
+        full_question = "Что изображено на фото?"
 
     user_content = [
-        {"type": "text", "text": f"Вопрос пользователя: {full_question}\nВот изображение:"},
+        {
+            "type": "text",
+            "text": (
+                f"Вопрос пользователя: '{full_question}'. "
+                f"Ниже приложено изображение. Используй его как контекст, "
+                f"но обязательно ответь именно на вопрос. "
+                f"Если вопрос не связан с изображением — отвечай всё равно."
+            )
+        },
         {"type": "image_url", "image_url": image_data}
     ]
 
