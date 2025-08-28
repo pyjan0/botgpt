@@ -1,5 +1,6 @@
 import logging
 import httpx
+import base64
 import os
 from io import BytesIO
 from telegram import Update
@@ -55,7 +56,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.photo[-1].get_file()
     file_bytes = await file.download_as_bytearray()
 
-    # GPT Vision: отправляем картинку и вопрос
+    # Переводим в base64
+    import base64
+    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+    image_data = f"data:image/jpeg;base64,{file_b64}"
+
+    # GPT Vision запрос
     async with httpx.AsyncClient() as client:
         try:
             r = await client.post(
@@ -72,7 +78,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": "Опиши, что на этой картинке"},
-                                {"type": "image_url", "image_url": "data:image/jpeg;base64," + file_bytes.hex()}
+                                {"type": "image_url", "image_url": image_data}
                             ]
                         }
                     ],
