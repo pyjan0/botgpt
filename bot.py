@@ -15,7 +15,7 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tg-webhook-bot")
+logger = logging.getLogger("tg-polling-bot")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8033358653"))
 DEFAULT_TOKENS = 20
@@ -27,7 +27,7 @@ FIREBASE_URL = "https://botgpttok-default-rtdb.europe-west1.firebasedatabase.app
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL")
-RENDER_URL = os.getenv("RENDER_URL")  # Например: https://myapp.onrender.com
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 DAN_PROMPT = """
 Ты полезный ассистент, который честно и понятно отвечает на вопросы.
@@ -257,31 +257,32 @@ async def admin_ask_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
-    if not txt.isdigit():
+    if not txt.lstrip("-").isdigit():
         await update.message.reply_text("Введите целое число.")
         return ASK_AMOUNT
-    target_id = context.user_data["target_id"]
-    await add_tokens(target_id, int(txt))
-    await update.message.reply_text(f"✅ Выдано {txt} токенов пользователю {target_id}", reply_markup=admin_menu)
+    amount = int(txt)
+    target_id = context.user_data.get("target_id")
+    await add_tokens(target_id, amount)
+    await update.message.reply_text(f"✅ Выдано {amount} токенов пользователю {target_id}.", reply_markup=admin_menu)
     return ADMIN_MENU
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Админ-диалог отменен.", reply_markup=user_menu)
+    await update.message.reply_text("Диалог отменен.", reply_markup=user_menu)
     return ConversationHandler.END
 
 # ================== MAIN ==================
 def main():
-    app = ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
 
-    # кнопки пользователя
-    app.add_handler(MessageHandler(filters.Regex("^💰 Мой баланс$|^➕ Пополнить \\(промокод\\)$|^ℹ️ Помощь$"), on_user_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_user_button))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # админ-меню
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_entry)],
         states={
@@ -294,21 +295,8 @@ def main():
     )
     app.add_handler(admin_conv)
 
-    # AI обработка
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # Webhook
-    port = int(os.environ.get("PORT", 5000))
-    webhook_url = f"{RENDER_URL}/webhook/{os.getenv('TELEGRAM_TOKEN')}"
-    logger.info(f"Запуск Webhook -> {webhook_url}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=f"webhook/{os.getenv('TELEGRAM_TOKEN')}",
-        webhook_url=webhook_url
-    )
+    # ======== Polling ========
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
