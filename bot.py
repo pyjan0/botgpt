@@ -4,7 +4,7 @@ import os
 import base64
 import json
 from io import BytesIO
-from typing import Tuple, Optional
+from typing import Optional
 
 from telegram import (
     Update,
@@ -17,35 +17,28 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     ConversationHandler,
-    CallbackContext,
     filters,
 )
-
-from config import TELEGRAM_TOKEN, OPENROUTER_API_KEY, OPENROUTER_MODEL
 
 # ========= НАСТРОЙКИ =========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-gpt-bot")
 
-# Админ ID из ENV или вручную
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8033358653"))  # укажи свой ID в переменной окружения ADMIN_ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8033358653"))
 
-# Стоимость операций (в токенах)
 TEXT_COST = int(os.getenv("TEXT_COST", "1"))
 PHOTO_COST = int(os.getenv("PHOTO_COST", "2"))
 DOC_COST = int(os.getenv("DOC_COST", "2"))
-
-# Начальный баланс новых пользователей
 DEFAULT_TOKENS = int(os.getenv("DEFAULT_TOKENS", "20"))
 
-# Файлы БД
 DB_FILE = "users.json"
 PROMO_FILE = "promocodes.json"
 
-# Webhook базовый URL (Render)
 RENDER_URL = os.getenv("RENDER_URL")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL")
 
-# Инструкция для модели
 DAN_PROMPT = """
 Ты полезный ассистент, который честно и понятно отвечает на вопросы.
 Если вместе с фото есть текстовый вопрос — приоритет отдавай вопросу, а фото используй как контекст.
@@ -59,7 +52,7 @@ def _load_json(path: str) -> dict:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            logger.exception(f"Поврежден файл {path}, будет пересоздан.")
+            logger.exception(f"Файл {path} поврежден, будет пересоздан.")
     return {}
 
 def _save_json(path: str, data: dict) -> None:
@@ -94,7 +87,6 @@ def use_tokens(user_id: int, amount: int) -> bool:
     return False
 
 def refund_tokens(user_id: int, amount: int) -> None:
-    # Возврат токенов при ошибке AI
     add_tokens(user_id, amount)
 
 def create_promo(code: str, amount: int) -> None:
@@ -104,6 +96,13 @@ def create_promo(code: str, amount: int) -> None:
 def redeem_promo(user_id: int, code: str) -> bool:
     if code in promos:
         add_tokens(user_id, int(promos[code]))
+        del promos[code]
+        _save_json(PROMO_FILE, promos)
+        return True
+    return False
+
+def delete_promo(code: str) -> bool:
+    if code in promos:
         del promos[code]
         _save_json(PROMO_FILE, promos)
         return True
@@ -122,7 +121,8 @@ admin_menu = ReplyKeyboardMarkup(
     [
         ["💰 Мой баланс", "➕ Пополнить (промокод)"],
         ["💎 Выдать токены", "🎁 Создать промокод"],
-        ["🔙 Назад"],
+        ["📜 Список промокодов", "❌ Удалить промокод"],
+        ["📊 Топ пользователей", "🔙 Назад"],
     ],
     resize_keyboard=True
 )
@@ -143,13 +143,8 @@ async def openrouter_chat(messages: list, model: str) -> str:
             r.raise_for_status()
             data = r.json()
             return data["choices"][0]["message"]["content"].strip()
-    except httpx.HTTPStatusError as e:
-        code = e.response.status_code
-        text = e.response.text
-        logger.error(f"Ошибка API {code}: {text}")
-        raise
     except Exception as e:
-        logger.error(f"Неизвестная ошибка API: {e}")
+        logger.error(f"Ошибка API: {e}")
         raise
 
 async def chat_with_ai_text(user_id: int, message: str) -> str:
@@ -180,12 +175,12 @@ async def chat_with_ai_image(user_question: str, b64_image: str) -> str:
     return await openrouter_chat(msgs, OPENROUTER_MODEL)
 
 async def chat_with_ai_file(filename: str, text: str) -> str:
-    snippet = text[:8000]  # безопасный лимит
+    snippet = text[:8000]
     prompt = (
         f"Пользователь прислал файл: {filename}\n"
         f"Объясни простыми словами, что это за файл, что делает код/содержимое, "
-        f"и укажи потенциальные проблемы, если они есть.\n\n"
-        f"Содержимое (фрагмент):\n{snippet}"
+        f"и укажи потенциальные проблемы.\n\n"
+        f"Содержимое:\n{snippet}"
     )
     msgs = [
         {"role": "system", "content": DAN_PROMPT},
@@ -202,15 +197,15 @@ async def send_help(update: Update):
         "ℹ️ Я GPT-бот:\n"
         "— Отвечаю на текстовые вопросы\n"
         "— Анализирую фото с подписью (caption)\n"
-        "— Читаю текстовые файлы (.py, .txt, .json) и объясняю их\n\n"
+        "— Читаю текстовые файлы (.py, .txt, .json и др.) и объясняю их\n\n"
         "Команды:\n"
         "/start — начать\n"
         "/balance — баланс\n"
         "/redeem КОД — применить промокод\n"
-        "\n"
+        "/top — топ пользователей по токенам\n"
     )
 
-# ========= ОБРАБОТЧИКИ /start /balance /redeem =========
+# ========= ОБРАБОТЧИКИ =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
@@ -233,8 +228,20 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Неверный или уже использованный промокод.")
 
+async def top_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["tokens"], reverse=True)
+    text = "📊 Топ пользователей по токенам:\n"
+    for uid, data in sorted_users[:10]:
+        text += f"{uid}: {data['tokens']} токенов\n"
+    await update.message.reply_text(text)
+
 # ========= ПОЛЬЗОВАТЕЛЬСКИЕ КНОПКИ =========
 async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("give_uid") or context.user_data.get("promo_code"):
+        return  # игнорируем если в админ-диалоге
+
     txt = update.message.text.strip()
     uid = update.effective_user.id
     if txt == "💰 Мой баланс":
@@ -244,30 +251,28 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif txt == "ℹ️ Помощь":
         await send_help(update)
 
-# ========= ТЕКСТ =========
+# ========= ТЕКСТ, ФОТО, ФАЙЛ =========
+TEXT_LIKE = {".txt", ".py", ".json", ".md", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv"}
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    # Пытаемся списать, если не хватает — сообщаем
     if not use_tokens(uid, TEXT_COST):
         await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
         return
-
     try:
         reply = await chat_with_ai_text(uid, update.message.text)
         await update.message.reply_text(reply)
     except Exception:
         refund_tokens(uid, TEXT_COST)
-        await update.message.reply_text("⚠️ Ошибка при обращении к AI. Токены возвращены.")
+        await update.message.reply_text("⚠️ Ошибка AI. Токены возвращены.")
 
-# ========= ФОТО =========
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     if not use_tokens(uid, PHOTO_COST):
         await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
         return
-
     try:
         file = await update.message.photo[-1].get_file()
         file_bytes = await file.download_as_bytearray()
@@ -277,10 +282,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
     except Exception:
         refund_tokens(uid, PHOTO_COST)
-        await update.message.reply_text("⚠️ Ошибка при обработке изображения. Токены возвращены.")
-
-# ========= ФАЙЛЫ =========
-TEXT_LIKE = {".txt", ".py", ".json", ".md", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv"}
+        await update.message.reply_text("⚠️ Ошибка AI. Токены возвращены.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -296,31 +298,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tgfile = await doc.get_file()
         file_bytes = await tgfile.download_as_bytearray()
-
         if ext in TEXT_LIKE:
             try:
                 text = file_bytes.decode("utf-8", errors="strict")
             except UnicodeDecodeError:
-                # пробуем мягче
                 text = file_bytes.decode("utf-8", errors="replace")
             reply = await chat_with_ai_file(filename, text)
             await update.message.reply_text(reply)
         else:
-            # Бинарники — просто возвращаем
             await update.message.reply_document(BytesIO(file_bytes), filename=filename)
-            await update.message.reply_text("Это бинарный файл — вернул его обратно.")
+            await update.message.reply_text("Это бинарный файл — вернул обратно.")
     except Exception:
         refund_tokens(uid, DOC_COST)
-        await update.message.reply_text("⚠️ Ошибка при обработке файла. Токены возвращены.")
+        await update.message.reply_text("⚠️ Ошибка AI. Токены возвращены.")
 
-# ========= АДМИН-ПАНЕЛЬ (ConversationHandler) =========
-(
-    ADMIN_MENU,
-    ASK_GIVE_ID,
-    ASK_GIVE_AMOUNT,
-    ASK_PROMO_CODE,
-    ASK_PROMO_AMOUNT,
-) = range(5)
+# ========= АДМИН =========
+(ADMIN_MENU, ASK_GIVE_ID, ASK_GIVE_AMOUNT, ASK_PROMO_CODE, ASK_PROMO_AMOUNT, ASK_DELETE_PROMO) = range(6)
 
 async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -331,39 +324,44 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-
     txt = update.message.text.strip()
-
     if txt == "💎 Выдать токены":
-        await update.message.reply_text("Введите USER_ID, кому выдать токены:", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Введите USER_ID:", reply_markup=ReplyKeyboardRemove())
         return ASK_GIVE_ID
-
     if txt == "🎁 Создать промокод":
-        await update.message.reply_text("Введите текст промокода (например, FREE50):", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Введите текст промокода:", reply_markup=ReplyKeyboardRemove())
         return ASK_PROMO_CODE
-
+    if txt == "📜 Список промокодов":
+        if promos:
+            text = "📜 Активные промокоды:\n" + "\n".join([f"{k}: {v}" for k,v in promos.items()])
+        else:
+            text = "📜 Промокодов нет."
+        await update.message.reply_text(text, reply_markup=admin_menu)
+        return ADMIN_MENU
+    if txt == "❌ Удалить промокод":
+        await update.message.reply_text("Введите код промокода для удаления:", reply_markup=ReplyKeyboardRemove())
+        return ASK_DELETE_PROMO
+    if txt == "📊 Топ пользователей":
+        await top_users(update, context)
+        return ADMIN_MENU
     if txt == "🔙 Назад":
         await update.message.reply_text("Вы вышли из админ-панели.", reply_markup=user_menu)
         return ConversationHandler.END
-
-    # Игнор прочих нажатий
     return ADMIN_MENU
 
-# — Выдать токены: шаг 1 (ID)
 async def admin_ask_give_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid_txt = update.message.text.strip()
     if not uid_txt.isdigit():
-        await update.message.reply_text("Нужен числовой USER_ID. Попробуйте снова или нажмите /cancel.")
+        await update.message.reply_text("Нужен числовой USER_ID. Попробуйте снова.")
         return ASK_GIVE_ID
     context.user_data["give_uid"] = int(uid_txt)
     await update.message.reply_text("Сколько токенов выдать?")
     return ASK_GIVE_AMOUNT
 
-# — Выдать токены: шаг 2 (количество)
 async def admin_ask_give_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount_txt = update.message.text.strip()
     if not amount_txt.lstrip("-").isdigit():
-        await update.message.reply_text("Введите целое число. Попробуйте снова или нажмите /cancel.")
+        await update.message.reply_text("Введите целое число.")
         return ASK_GIVE_AMOUNT
     amount = int(amount_txt)
     target_id = context.user_data.get("give_uid")
@@ -372,21 +370,19 @@ async def admin_ask_give_amount(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.pop("give_uid", None)
     return ADMIN_MENU
 
-# — Создать промокод: шаг 1 (код)
 async def admin_ask_promo_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip()
     if not code or " " in code:
-        await update.message.reply_text("Промокод не должен быть пустым и без пробелов. Попробуйте снова или нажмите /cancel.")
+        await update.message.reply_text("Промокод не должен быть пустым и без пробелов.")
         return ASK_PROMO_CODE
     context.user_data["promo_code"] = code
     await update.message.reply_text("На сколько токенов этот промокод?")
     return ASK_PROMO_AMOUNT
 
-# — Создать промокод: шаг 2 (количество)
 async def admin_ask_promo_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount_txt = update.message.text.strip()
     if not amount_txt.lstrip("-").isdigit():
-        await update.message.reply_text("Введите целое число. Попробуйте снова или нажмите /cancel.")
+        await update.message.reply_text("Введите целое число.")
         return ASK_PROMO_AMOUNT
     amount = int(amount_txt)
     code = context.user_data.get("promo_code")
@@ -395,56 +391,53 @@ async def admin_ask_promo_amount(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.pop("promo_code", None)
     return ADMIN_MENU
 
-async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_admin(update.effective_user.id):
-        await update.message.reply_text("Админ-диалог отменён.", reply_markup=admin_menu)
+async def admin_ask_delete_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip()
+    if delete_promo(code):
+        await update.message.reply_text(f"✅ Промокод {code} удалён.", reply_markup=admin_menu)
     else:
-        await update.message.reply_text("Диалог отменён.", reply_markup=user_menu)
+        await update.message.reply_text(f"❌ Промокод {code} не найден.", reply_markup=admin_menu)
+    return ADMIN_MENU
+
+async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Диалог отменён.", reply_markup=admin_menu if is_admin(update.effective_user.id) else user_menu)
     return ConversationHandler.END
 
 # ========= MAIN =========
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
+    app.add_handler(CommandHandler("top", top_users))
 
-    # пользовательские кнопки
-    app.add_handler(MessageHandler(filters.Regex("^💰 Мой баланс$|^➕ Пополнить \\(промокод\\)$|^ℹ️ Помощь$"), on_user_button))
-
-    # админ-панель (вход /admin)
+    # админ-панель
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_entry)],
         states={
-            ADMIN_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_handler),
-            ],
-            ASK_GIVE_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_give_id),
-            ],
-            ASK_GIVE_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_give_amount),
-            ],
-            ASK_PROMO_CODE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_promo_code),
-            ],
-            ASK_PROMO_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_promo_amount),
-            ],
+            ADMIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_handler)],
+            ASK_GIVE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_give_id)],
+            ASK_GIVE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_give_amount)],
+            ASK_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_promo_code)],
+            ASK_PROMO_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_promo_amount)],
+            ASK_DELETE_PROMO: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_delete_promo)],
         },
         fallbacks=[CommandHandler("cancel", admin_cancel)],
         allow_reentry=True,
     )
     app.add_handler(admin_conv)
 
-    # сообщения (как раньше)
+    # обработка медиа
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # пользовательские кнопки — в самом конце, чтобы админ-диалог приоритетный
+    app.add_handler(MessageHandler(filters.Regex("^💰 Мой баланс$|^➕ Пополнить \\(промокод\\)$|^ℹ️ Помощь$"), on_user_button))
+    
+    # обработчик текста для AI
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Webhook
     port = int(os.environ.get("PORT", 5000))
     webhook_url = f"{RENDER_URL}/webhook/{TELEGRAM_TOKEN}"
     logger.info(f"Запуск бота 🚀 Webhook -> {webhook_url}")
