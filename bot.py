@@ -15,10 +15,10 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tg-bot")
+logger = logging.getLogger("tg-webhook-bot")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8033358653"))
-DEFAULT_TOKENS = int(os.getenv("DEFAULT_TOKENS", "20"))
+DEFAULT_TOKENS = 20
 TEXT_COST = 1
 PHOTO_COST = 2
 DOC_COST = 2
@@ -27,12 +27,15 @@ FIREBASE_URL = "https://botgpttok-default-rtdb.europe-west1.firebasedatabase.app
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL")
+RENDER_URL = os.getenv("RENDER_URL")  # Например: https://myapp.onrender.com
 
 DAN_PROMPT = """
 Ты полезный ассистент, который честно и понятно отвечает на вопросы.
 Если вместе с фото есть текстовый вопрос — приоритет отдавай вопросу, а фото используй как контекст.
 Если прислан файл с текстом — объясни, что это за файл и что он делает. Будь кратким и по делу.
 """
+
+TEXT_LIKE = {".txt", ".py", ".json", ".md", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv"}
 
 # ================== FIREBASE ==================
 async def firebase_get(path: str):
@@ -89,7 +92,6 @@ async def redeem_promo(user_id: int, code: str):
     promo = await firebase_get(f"promos/{code}")
     if promo:
         await add_tokens(user_id, int(promo["amount"]))
-        # удалить промокод после использования
         await firebase_patch(f"promos", {code: None})
         return True
     return False
@@ -125,6 +127,20 @@ async def openrouter_chat(messages: list, model: str) -> str:
 
 async def chat_with_ai_text(user_id: int, message: str) -> str:
     msgs = [{"role": "system", "content": DAN_PROMPT}, {"role": "user", "content": message}]
+    return await openrouter_chat(msgs, OPENROUTER_MODEL)
+
+async def chat_with_ai_file(filename: str, text: str) -> str:
+    snippet = text[:8000]
+    prompt = f"Пользователь прислал файл {filename}. Объясни что это, что делает, возможные проблемы.\n\n{snippet}"
+    msgs = [{"role": "system", "content": DAN_PROMPT}, {"role": "user", "content": prompt}]
+    return await openrouter_chat(msgs, OPENROUTER_MODEL)
+
+async def chat_with_ai_image(user_question: str, b64_image: str) -> str:
+    user_content = [
+        {"type": "text", "text": f"Вопрос: {user_question}"},
+        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64_image}"},
+    ]
+    msgs = [{"role": "system", "content": DAN_PROMPT}, {"role": "user", "content": user_content}]
     return await openrouter_chat(msgs, OPENROUTER_MODEL)
 
 # ================== ОБРАБОТЧИКИ ==================
@@ -174,6 +190,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reply = await chat_with_ai_text(uid, update.message.text)
     await update.message.reply_text(reply)
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await ensure_user(uid)
+    if not await use_tokens(uid, PHOTO_COST):
+        await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
+        return
+    file = await update.message.photo[-1].get_file()
+    file_bytes = await file.download_as_bytearray()
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    question = (update.message.caption or "Что изображено на фото?").strip()
+    reply = await chat_with_ai_image(question, b64)
+    await update.message.reply_text(reply)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await ensure_user(uid)
+    if not await use_tokens(uid, DOC_COST):
+        await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
+        return
+    doc = update.message.document
+    filename = doc.file_name or "file"
+    ext = os.path.splitext(filename.lower())[1]
+    tgfile = await doc.get_file()
+    file_bytes = await tgfile.download_as_bytearray()
+    if ext in TEXT_LIKE:
+        try:
+            text = file_bytes.decode("utf-8", errors="replace")
+        except:
+            text = "<не удалось прочитать файл>"
+        reply = await chat_with_ai_file(filename, text)
+        await update.message.reply_text(reply)
+    else:
+        await update.message.reply_document(BytesIO(file_bytes), filename=filename)
+        await update.message.reply_text("Это бинарный файл — вернул его обратно.")
 
 # ================== АДМИН ==================
 (ADMIN_MENU, ASK_USER_ID, ASK_AMOUNT) = range(3)
@@ -227,7 +278,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
 
-    # кнопки
+    # кнопки пользователя
     app.add_handler(MessageHandler(filters.Regex("^💰 Мой баланс$|^➕ Пополнить \\(промокод\\)$|^ℹ️ Помощь$"), on_user_button))
 
     # админ-меню
@@ -243,10 +294,21 @@ def main():
     )
     app.add_handler(admin_conv)
 
-    # текстовые сообщения
+    # AI обработка
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    app.run_polling()
+    # Webhook
+    port = int(os.environ.get("PORT", 5000))
+    webhook_url = f"{RENDER_URL}/webhook/{os.getenv('TELEGRAM_TOKEN')}"
+    logger.info(f"Запуск Webhook -> {webhook_url}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=f"webhook/{os.getenv('TELEGRAM_TOKEN')}",
+        webhook_url=webhook_url
+    )
 
 if __name__ == "__main__":
     main()
