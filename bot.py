@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-gpt-bot")
 
 # Админ ID из ENV или вручную
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # укажи свой ID в переменной окружения ADMIN_ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8033358653"))  # укажи свой ID в переменной окружения ADMIN_ID
 
 # Стоимость операций (в токенах)
 TEXT_COST = int(os.getenv("TEXT_COST", "1"))
@@ -207,7 +207,7 @@ async def send_help(update: Update):
         "/start — начать\n"
         "/balance — баланс\n"
         "/redeem КОД — применить промокод\n"
-        "/admin — админ-панель (только для администратора)\n"
+        "\n"
     )
 
 # ========= ОБРАБОТЧИКИ /start /balance /redeem =========
