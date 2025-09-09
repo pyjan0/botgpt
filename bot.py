@@ -95,20 +95,17 @@ def change_balance(user_id, amount):
     @firestore.transactional
     def update_in_transaction(tr):
         doc = ref.get(transaction=tr)
-        if doc.exists:
-            tokens = doc.get("tokens")
-            if tokens is None:
-                tokens = DEFAULT_TOKENS
-            tokens += amount
-            tokens = max(tokens, 0)
-            tr.update(ref, {"tokens": tokens})
-            return tokens
-        else:
-            # новый пользователь с дефолтными токенами
-            tr.set(ref, {"tokens": max(DEFAULT_TOKENS + amount, 0), "memory": []})
-            return max(DEFAULT_TOKENS + amount, 0)
+        data = doc.to_dict() or {}  # получаем словарь документа, если нет — пустой
+        tokens = data.get("tokens", DEFAULT_TOKENS)
+        tokens += amount
+        tokens = max(tokens, 0)
+
+        # обновляем или создаём документ
+        tr.set(ref, {"tokens": tokens, "memory": data.get("memory", [])}, merge=True)
+        return tokens
 
     return update_in_transaction(transaction)
+
 
 
 def cost_for_model(model_name: str) -> int:
