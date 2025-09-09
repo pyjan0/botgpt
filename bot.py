@@ -90,20 +90,23 @@ def update_user(user_id: int, data: Dict[str, Any]):
 
 def change_balance(user_id, amount):
     ref = user_doc_ref(user_id)
-    transaction = db.transaction()  # создаём транзакцию
+    transaction = db.transaction()
 
     @firestore.transactional
     def update_in_transaction(tr):
         doc = ref.get(transaction=tr)
         if doc.exists:
-            tokens = doc.get("tokens", default=0) + amount
+            tokens = doc.get("tokens")
+            if tokens is None:
+                tokens = DEFAULT_TOKENS
+            tokens += amount
             tokens = max(tokens, 0)
             tr.update(ref, {"tokens": tokens})
             return tokens
         else:
-            # создаём нового пользователя с дефолтным балансом
-            tr.set(ref, {"tokens": max(amount, 0), "memory": []})
-            return max(amount, 0)
+            # новый пользователь с дефолтными токенами
+            tr.set(ref, {"tokens": max(DEFAULT_TOKENS + amount, 0), "memory": []})
+            return max(DEFAULT_TOKENS + amount, 0)
 
     return update_in_transaction(transaction)
 
