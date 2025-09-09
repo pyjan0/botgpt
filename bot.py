@@ -6,6 +6,7 @@ import random
 import logging
 from io import BytesIO
 from typing import Dict, Any
+from google.cloud import firestore
 
 import httpx
 from telegram import Update
@@ -86,15 +87,26 @@ def get_user(user_id):
 def update_user(user_id: int, data: Dict[str, Any]):
     user_doc_ref(user_id).set(data, merge=True)
 
-def change_balance(user_id: int, delta: int) -> int:
+
+def change_balance(user_id, amount):
     ref = user_doc_ref(user_id)
-    def transaction_update(transaction, ref):
-        snap = ref.get(transaction=transaction)
-        cur = snap.to_dict().get("balance", 0) if snap.exists else 0
-        new = cur + delta
-        transaction.set(ref, {"balance": new}, merge=True)
-        return new
-    return db.run_transaction(lambda tr: transaction_update(tr, ref))
+    transaction = db.transaction()  # создаём транзакцию
+
+    @firestore.transactional
+    def update_in_transaction(tr):
+        doc = ref.get(transaction=tr)
+        if doc.exists:
+            tokens = doc.get("tokens", 0) + amount
+            tokens = max(tokens, 0)
+            tr.update(ref, {"tokens": tokens})
+            return tokens
+        else:
+            # создаём нового пользователя с дефолтным балансом
+            tr.set(ref, {"tokens": max(amount, 0), "memory": []})
+            return max(amount, 0)
+
+    return update_in_transaction(transaction)
+
 
 def cost_for_model(model_name: str) -> int:
     return MODEL_COSTS.get(model_name, MODEL_COSTS[DEFAULT_MODEL])
