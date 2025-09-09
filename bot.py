@@ -1,320 +1,245 @@
-import logging
+# bot.py
 import os
 import base64
+import json
+import random
+import logging
 from io import BytesIO
+from typing import Dict, Any
 
 import httpx
-import firebase_admin
-from firebase_admin import credentials, db
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-from config import TELEGRAM_TOKEN, OPENROUTER_API_KEY, OPENROUTER_MODEL, FIREBASE_CRED_JSON
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-# ========= ЛОГИ =========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-gpt-bot")
 
-# ========= Настройки =========
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8033358653"))
-TEXT_COST = int(os.getenv("TEXT_COST", "1"))
-PHOTO_COST = int(os.getenv("PHOTO_COST", "2"))
-DOC_COST = int(os.getenv("DOC_COST", "2"))
-DEFAULT_TOKENS = int(os.getenv("DEFAULT_TOKENS", "20"))
+# ====== CONFIG / ENV ======
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+RENDER_URL = os.environ.get("RENDER_URL")
 
-# ========= Firebase =========
-cred = credentials.Certificate(FIREBASE_CRED_JSON)
-firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://botgpttok-default-rtdb.europe-west1.firebasedatabase.app/"
-})
-users_ref = db.reference("users")
-promos_ref = db.reference("promos")
-history_ref = db.reference("history")  # опционально для логов операций
+# список ключей для OpenRouter (через запятую в ENV)
+OPENROUTER_KEYS = os.environ.get("OPENROUTER_KEYS", "").split(",")
+OPENROUTER_KEYS = [k.strip() for k in OPENROUTER_KEYS if k.strip()]
+if not OPENROUTER_KEYS:
+    raise RuntimeError("Нет ключей OpenRouter! Укажи их в OPENROUTER_KEYS")
 
-# ========= GPT =========
-DAN_PROMPT = """Ты полезный ассистент, который честно и понятно отвечает на вопросы."""
+# стоимость запросов
+MODEL_COSTS = {
+    "gpt-3.5-turbo": 10,
+    "gpt-4o-mini": 50,
+    "gpt-4o": 150,
+}
+DEFAULT_MODEL = "gpt-3.5-turbo"
 
-async def openrouter_chat(messages: list, model: str) -> str:
+DAN_PROMPT = "Ты полезный ассистент, который честно и понятно отвечает на вопросы."
+
+# ====== FIREBASE INIT ======
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+if not firebase_admin._apps:
+    sa_json = FIREBASE_SERVICE_ACCOUNT_JSON
+    if not sa_json:
+        raise RuntimeError("Не задана FIREBASE_SERVICE_ACCOUNT_JSON")
+
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages},
-                timeout=60,
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"].strip()
+        if sa_json.strip().startswith("{"):
+            sa = json.loads(sa_json)
+        else:
+            sa = json.loads(base64.b64decode(sa_json).decode("utf-8"))
     except Exception as e:
-        logger.error(f"Ошибка GPT API: {e}")
-        raise
+        raise RuntimeError("Ошибка чтения сервисного аккаунта Firebase") from e
 
-async def chat_with_ai_text(user_id: int, message: str) -> str:
-    msgs = [
-        {"role": "system", "content": DAN_PROMPT},
-        {"role": "user", "content": message}
-    ]
-    return await openrouter_chat(msgs, OPENROUTER_MODEL)
+    cred = credentials.Certificate(sa)
+    firebase_admin.initialize_app(cred, {'projectId': FIREBASE_PROJECT_ID})
+db = firestore.client()
 
-async def chat_with_ai_image(user_question: str, b64_image: str) -> str:
-    user_content = [
-        {"type": "text", "text": f"Вопрос пользователя: {user_question}\nНиже приложено изображение. Используй его как контекст."},
-        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64_image}"}
-    ]
-    msgs = [
-        {"role": "system", "content": DAN_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-    return await openrouter_chat(msgs, OPENROUTER_MODEL)
+COL_USERS = "users"
+COL_PROMOS = "promocodes"
 
-async def chat_with_ai_file(filename: str, text: str) -> str:
-    snippet = text[:8000]
-    prompt = f"Пользователь прислал файл: {filename}\nОбъясни, что это за файл и его содержание.\nФрагмент:\n{snippet}"
-    msgs = [{"role": "system", "content": DAN_PROMPT}, {"role": "user", "content": prompt}]
-    return await openrouter_chat(msgs, OPENROUTER_MODEL)
+# ====== HELPERS ======
+def user_doc_ref(user_id: int):
+    return db.collection(COL_USERS).document(str(user_id))
 
-# ========= ХЕЛПЕРЫ Firebase =========
-def ensure_user(user_id: int):
-    uid = str(user_id)
-    if not users_ref.child(uid).get():
-        users_ref.child(uid).set({"tokens": DEFAULT_TOKENS})
+def get_user(user_id: int) -> Dict[str, Any]:
+    doc = user_doc_ref(user_id).get()
+    if doc.exists:
+        return doc.to_dict()
+    data = {"balance": 0, "model": DEFAULT_MODEL, "memory": ""}
+    user_doc_ref(user_id).set(data)
+    return data
 
-def get_tokens(user_id: int) -> int:
-    uid = str(user_id)
-    data = users_ref.child(uid).get()
-    return data.get("tokens", DEFAULT_TOKENS) if data else DEFAULT_TOKENS
+def update_user(user_id: int, data: Dict[str, Any]):
+    user_doc_ref(user_id).set(data, merge=True)
 
-def add_tokens(user_id: int, amount: int):
-    uid = str(user_id)
-    ensure_user(user_id)
-    tokens = get_tokens(user_id) + amount
-    users_ref.child(uid).update({"tokens": tokens})
+def change_balance(user_id: int, delta: int) -> int:
+    ref = user_doc_ref(user_id)
+    def transaction_update(transaction, ref):
+        snap = ref.get(transaction=transaction)
+        cur = snap.to_dict().get("balance", 0) if snap.exists else 0
+        new = cur + delta
+        transaction.set(ref, {"balance": new}, merge=True)
+        return new
+    return db.run_transaction(lambda tr: transaction_update(tr, ref))
 
-def use_tokens(user_id: int, amount: int) -> bool:
-    uid = str(user_id)
-    ensure_user(user_id)
-    tokens = get_tokens(user_id)
-    if tokens >= amount:
-        users_ref.child(uid).update({"tokens": tokens - amount})
-        return True
-    return False
+def cost_for_model(model_name: str) -> int:
+    return MODEL_COSTS.get(model_name, MODEL_COSTS[DEFAULT_MODEL])
 
-def refund_tokens(user_id: int, amount: int):
-    add_tokens(user_id, amount)
+# ====== CHAT WITH AI ======
+async def chat_with_ai(user_id: int, message_content) -> str:
+    model = get_user(user_id).get("model", DEFAULT_MODEL)
+    system_messages = [{"role": "system", "content": DAN_PROMPT}]
+    memory = get_user(user_id).get("memory", "")
+    if memory:
+        system_messages.append({"role": "system", "content": f"Память: {memory}"})
 
-def create_promo(code: str, amount: int):
-    promos_ref.child(code).set(amount)
+    user_part = {"role": "user", "content": message_content}
 
-def redeem_promo(user_id: int, code: str) -> bool:
-    if promos_ref.child(code).get():
-        add_tokens(user_id, promos_ref.child(code).get())
-        promos_ref.child(code).delete()
-        return True
-    return False
+    # пробуем ключи по очереди
+    for key in random.sample(OPENROUTER_KEYS, len(OPENROUTER_KEYS)):
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": system_messages + [user_part],
+                    },
+                    timeout=60,
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error(f"Ключ {key[:10]}... не сработал: {e}")
 
-# ========= МЕНЮ =========
-user_menu = ReplyKeyboardMarkup([["💰 Мой баланс", "➕ Пополнить (промокод)"], ["ℹ️ Помощь"]], resize_keyboard=True)
-admin_menu = ReplyKeyboardMarkup([["💰 Мой баланс", "➕ Пополнить (промокод)"], ["💎 Выдать токены", "🎁 Создать промокод"], ["🔙 Назад"]], resize_keyboard=True)
+    return "⚠️ Все ключи сейчас недоступны. Попробуй позже."
 
-# ========= ОБРАБОТЧИКИ =========
+# ====== COMMANDS ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    kb = admin_menu if uid == ADMIN_ID else user_menu
-    await update.message.reply_text("Привет! Я GPT-бот 🤖", reply_markup=kb)
+    await update.message.reply_text(
+        "Привет! Я бот 🤖\n"
+        "Команды:\n"
+        "/balance — баланс\n"
+        "/redeem <код> — ввести промокод\n"
+        "/memory — показать память\n"
+        "/remember <текст> — сохранить память\n"
+        "/clearmemory — очистить память\n"
+        "/setmodel <model> — выбрать модель (gpt-3.5-turbo, gpt-4o-mini, gpt-4o)\n"
+    )
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    await update.message.reply_text(f"💰 Ваш баланс: {get_tokens(uid)} токенов.")
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    await update.message.reply_text(f"Баланс: {u['balance']} коинов\nМодель: {u['model']}")
+
+async def remember_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Использование: /remember <текст>")
+        return
+    update_user(update.effective_user.id, {"memory": text})
+    await update.message.reply_text("Память сохранена ✅")
+
+async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mem = get_user(update.effective_user.id).get("memory", "")
+    await update.message.reply_text(mem or "Память пуста.")
+
+async def clearmemory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    update_user(update.effective_user.id, {"memory": ""})
+    await update.message.reply_text("Память очищена.")
+
+async def setmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Пример: /setmodel gpt-3.5-turbo")
+        return
+    model = context.args[0]
+    if model not in MODEL_COSTS:
+        await update.message.reply_text("Недоступная модель.")
+        return
+    update_user(update.effective_user.id, {"model": model})
+    await update.message.reply_text(f"Модель установлена: {model}")
 
 async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Введите промокод так: /redeem КОД")
+        await update.message.reply_text("Использование: /redeem <код>")
         return
-    code = context.args[0].strip()
-    if redeem_promo(uid, code):
-        await update.message.reply_text("✅ Промокод применён! Баланс пополнен.")
-    else:
-        await update.message.reply_text("❌ Неверный или уже использованный промокод.")
-
-# Пользовательские кнопки
-async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    uid = update.effective_user.id
-    if txt == "💰 Мой баланс":
-        await balance(update, context)
-    elif txt == "➕ Пополнить (промокод)":
-        await update.message.reply_text("Введите промокод командой: /redeem КОД")
-    elif txt == "ℹ️ Помощь":
-        await update.message.reply_text("ℹ️ Я GPT-бот:\nОтвечаю на вопросы, анализирую файлы и фото.\nКоманды: /start, /balance, /redeem КОД")
-
-# Текст
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    if not use_tokens(uid, TEXT_COST):
-        await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
+    code = context.args[0].upper()
+    doc_ref = db.collection(COL_PROMOS).document(code)
+    doc = doc_ref.get()
+    if not doc.exists:
+        await update.message.reply_text("Такого промокода нет.")
         return
+    data = doc.to_dict()
+    if data["uses_left"] <= 0:
+        await update.message.reply_text("У промокода закончились активации.")
+        return
+
+    def txn_fn(transaction, ref):
+        snap = ref.get(transaction=transaction)
+        d = snap.to_dict()
+        if d["uses_left"] <= 0:
+            raise RuntimeError("no_uses")
+        transaction.update(ref, {"uses_left": d["uses_left"] - 1})
+        return d["amount"]
+
     try:
-        reply = await chat_with_ai_text(uid, update.message.text)
-        await update.message.reply_text(reply)
-    except Exception:
-        refund_tokens(uid, TEXT_COST)
-        await update.message.reply_text("⚠️ Ошибка при обращении к AI. Токены возвращены.")
+        amount = db.run_transaction(lambda tr: txn_fn(tr, doc_ref))
+        new_bal = change_balance(update.effective_user.id, amount)
+        await update.message.reply_text(f"+{amount} коинов! Баланс: {new_bal}")
+    except:
+        await update.message.reply_text("Не удалось активировать код.")
 
-# Фото
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ====== MESSAGE HANDLERS ======
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    ensure_user(uid)
-    if not use_tokens(uid, PHOTO_COST):
-        await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
+    text = update.message.text.strip()
+    user = get_user(uid)
+    model = user["model"]
+    cost = cost_for_model(model)
+
+    if user["balance"] < cost:
+        await update.message.reply_text(f"Нужно {cost} коинов, у тебя {user['balance']}.")
         return
-    try:
-        file = await update.message.photo[-1].get_file()
-        file_bytes = await file.download_as_bytearray()
-        b64 = base64.b64encode(file_bytes).decode("utf-8")
-        question = (update.message.caption or "Что изображено на фото?").strip()
-        reply = await chat_with_ai_image(question, b64)
-        await update.message.reply_text(reply)
-    except Exception:
-        refund_tokens(uid, PHOTO_COST)
-        await update.message.reply_text("⚠️ Ошибка при обработке изображения. Токены возвращены.")
 
-# Файлы
-TEXT_LIKE = {".txt", ".py", ".json", ".md", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv"}
+    new_bal = change_balance(uid, -cost)
+    await update.message.reply_text(f"Списано {cost} коинов. Остаток: {new_bal}")
+    reply = await chat_with_ai(uid, text)
+    await update.message.reply_text(reply)
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    if not use_tokens(uid, DOC_COST):
-        await update.message.reply_text("❌ Недостаточно токенов. Введите промокод: /redeem КОД")
-        return
-    doc = update.message.document
-    filename = doc.file_name or "file"
-    ext = os.path.splitext(filename.lower())[1]
-    try:
-        tgfile = await doc.get_file()
-        file_bytes = await tgfile.download_as_bytearray()
-        if ext in TEXT_LIKE:
-            try:
-                text = file_bytes.decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                text = file_bytes.decode("utf-8", errors="replace")
-            reply = await chat_with_ai_file(filename, text)
-            await update.message.reply_text(reply)
-        else:
-            await update.message.reply_document(BytesIO(file_bytes), filename=filename)
-            await update.message.reply_text("Это бинарный файл — вернул его обратно.")
-    except Exception:
-        refund_tokens(uid, DOC_COST)
-        await update.message.reply_text("⚠️ Ошибка при обработке файла. Токены возвращены.")
-
-# ========= АДМИН =========
-(ADMIN_MENU, ASK_GIVE_ID, ASK_GIVE_AMOUNT, ASK_PROMO_CODE, ASK_PROMO_AMOUNT) = range(5)
-
-async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await update.message.reply_text("🔧 Админ-меню", reply_markup=admin_menu)
-    return ADMIN_MENU
-
-async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-    txt = update.message.text.strip()
-    if txt == "💎 Выдать токены":
-        await update.message.reply_text("Введите USER_ID:", reply_markup=ReplyKeyboardRemove())
-        return ASK_GIVE_ID
-    elif txt == "🎁 Создать промокод":
-        await update.message.reply_text("Введите текст промокода:", reply_markup=ReplyKeyboardRemove())
-        return ASK_PROMO_CODE
-    elif txt == "🔙 Назад":
-        await update.message.reply_text("Вы вышли из админ-панели.", reply_markup=user_menu)
-        return ConversationHandler.END
-    return ADMIN_MENU
-
-async def admin_ask_give_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid_txt = update.message.text.strip()
-    if not uid_txt.isdigit():
-        await update.message.reply_text("Нужен числовой USER_ID.")
-        return ASK_GIVE_ID
-    context.user_data["give_uid"] = int(uid_txt)
-    await update.message.reply_text("Сколько токенов выдать?")
-    return ASK_GIVE_AMOUNT
-
-async def admin_ask_give_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    amount_txt = update.message.text.strip()
-    if not amount_txt.lstrip("-").isdigit():
-        await update.message.reply_text("Введите число.")
-        return ASK_GIVE_AMOUNT
-    amount = int(amount_txt)
-    target_id = context.user_data.pop("give_uid", None)
-    add_tokens(target_id, amount)
-    await update.message.reply_text(f"✅ Выдано {amount} токенов пользователю {target_id}.", reply_markup=admin_menu)
-    return ADMIN_MENU
-
-async def admin_ask_promo_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    context.user_data["promo_code"] = code
-    await update.message.reply_text("На сколько токенов этот промокод?")
-    return ASK_PROMO_AMOUNT
-
-async def admin_ask_promo_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    amount_txt = update.message.text.strip()
-    amount = int(amount_txt)
-    code = context.user_data.pop("promo_code", None)
-    create_promo(code, amount)
-    await update.message.reply_text(f"✅ Промокод {code} создан на {amount} токенов.", reply_markup=admin_menu)
-    return ADMIN_MENU
-
-async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Админ-диалог отменён.", reply_markup=admin_menu)
-    return ConversationHandler.END
-
-# ========= MAIN =========
+# ====== MAIN ======
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("remember", remember_cmd))
+    app.add_handler(CommandHandler("memory", memory_cmd))
+    app.add_handler(CommandHandler("clearmemory", clearmemory_cmd))
+    app.add_handler(CommandHandler("setmodel", setmodel_cmd))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # пользовательские кнопки
-    app.add_handler(MessageHandler(filters.Regex("^💰 Мой баланс$|^➕ Пополнить \\(промокод\\)$|^ℹ️ Помощь$"), on_user_button))
+    port = int(os.environ.get("PORT", 5000))
+    webhook_url = f"{RENDER_URL}/webhook/{TELEGRAM_TOKEN}"
 
-    # админ
-    admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_entry)],
-        states={
-            ADMIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_handler)],
-            ASK_GIVE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_give_id)],
-            ASK_GIVE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_give_amount)],
-            ASK_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_promo_code)],
-            ASK_PROMO_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ask_promo_amount)],
-        },
-        fallbacks=[CommandHandler("cancel", admin_cancel)],
-        allow_reentry=True,
+    logger.info(f"Запуск 🚀 Webhook -> {webhook_url}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=f"webhook/{TELEGRAM_TOKEN}",
+        webhook_url=webhook_url,
     )
-    app.add_handler(admin_conv)
-
-    # обработка сообщений
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("Бот запущен 🚀 Polling")
-    app.run_polling()
 
 if __name__ == "__main__":
     main()
