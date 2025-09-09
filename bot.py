@@ -96,7 +96,7 @@ def change_balance(user_id, amount):
     def update_in_transaction(tr):
         doc = ref.get(transaction=tr)
         if doc.exists:
-            tokens = doc.get("tokens", 0) + amount
+            tokens = doc.get("tokens", default=0) + amount
             tokens = max(tokens, 0)
             tr.update(ref, {"tokens": tokens})
             return tokens
