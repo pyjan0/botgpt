@@ -33,11 +33,11 @@ if not OPENROUTER_KEYS:
 
 # стоимость запросов
 MODEL_COSTS = {
-    "gpt-3.5-turbo": 10,
-    "gpt-4o-mini": 50,
-    "gpt-4o": 150,
+    "gpt-3.5-turbo": 3,
+    "gpt-4o-mini": 5,
+    "gpt-4o": 7,
 }
-DEFAULT_MODEL = "gpt-3.5-turbo"
+DEFAULT_MODEL = "gpt-4o"
 
 DAN_PROMPT = "Ты полезный ассистент, который честно и понятно отвечает на вопросы."
 
@@ -69,13 +69,19 @@ COL_PROMOS = "promocodes"
 def user_doc_ref(user_id: int):
     return db.collection(COL_USERS).document(str(user_id))
 
-def get_user(user_id: int) -> Dict[str, Any]:
-    doc = user_doc_ref(user_id).get()
+DEFAULT_TOKENS = 60  # хватит на +-9 запросов
+
+def get_user(user_id):
+    ref = user_doc_ref(user_id)
+    doc = ref.get()
     if doc.exists:
         return doc.to_dict()
-    data = {"balance": 0, "model": DEFAULT_MODEL, "memory": ""}
-    user_doc_ref(user_id).set(data)
-    return data
+    else:
+        # создаём нового пользователя с дефолтным балансом
+        user_data = {"tokens": DEFAULT_TOKENS, "memory": []}
+        ref.set(user_data)
+        return user_data
+
 
 def update_user(user_id: int, data: Dict[str, Any]):
     user_doc_ref(user_id).set(data, merge=True)
